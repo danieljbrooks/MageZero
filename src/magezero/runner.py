@@ -50,7 +50,12 @@ PRIMARY_PORT = 50052
 OPPONENT_PORT = 50053
 TMP_DIR = Path(".mz_tmp")
 RUNS_DIR = Path("runs")
-SRC = "src/magezero"
+# Where this package lives on disk. run_train/run_test/start_server launch sibling modules
+# as SCRIPTS rather than with -m, because those modules use flat imports (`from model
+# import ...`) that only resolve when the script's own directory is on sys.path. A
+# repo-relative path worked only inside a MageZero checkout: installed as a dependency
+# there is no src/magezero/, and every training step died with "can't open file".
+SRC = os.path.dirname(os.path.abspath(__file__))
 PYTHON = sys.executable
 EPOCHS_BOOTSTRAP = 2
 EPOCHS_ONLINE = 1

@@ -8,7 +8,7 @@ from torch import nn  # optim is not strictly needed for testing if not optimizi
 from torch.utils.data import DataLoader
 
 from dataset import H5Indexed, collate_batch, filter_opponent_states
-from model import BATCH_SIZE, NetTransformer, load_model, build_model_from_checkpoint, DEVICE, autocast, PRIORITY_A_MAX, PRIORITY_B_MAX, TARGETS_MAX, BINARY_MAX, ActionType, lambda_pA, lambda_pB, lambda_t, lambda_b, normalize_policy_labels
+from model import BATCH_SIZE, NetTransformer, load_model, build_model_from_checkpoint, DEVICE, autocast, GLOBAL_MAX, PRIORITY_A_MAX, PRIORITY_B_MAX, TARGETS_MAX, BINARY_MAX, ActionType, lambda_pA, lambda_pB, lambda_t, lambda_b, normalize_policy_labels
 from vocab import FeatureVocab
 
 SHOW_CONFUSION_MATRIX = True

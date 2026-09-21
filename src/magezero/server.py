@@ -90,7 +90,15 @@ def init(deck: str, version: int, port: int, checkpoint: str | None = None):
     threading.Thread(target=stats_loop, daemon=True).start()
 
     print(f"[INIT] deck={deck} ver={version} model={model_path} port={port} device={DEVICE} action_dim={head}", flush=True)
-    waitress.serve(app, host="127.0.0.1", port=port, threads=6)
+    # One HTTP worker per concurrent game thread, or game threads block in waitress's queue
+    # waiting to be accepted -- before any inference work starts. With 32 JVM game threads
+    # against the old hard-coded 6, the queue sat 14-17 deep and the box ran at 44% of its
+    # CPU quota with the GPU at 12%: nothing was saturated, everything was waiting.
+    # These threads are I/O-bound (they enqueue and await a batched forward pass), so they
+    # cost little beyond stack space.
+    threads = int(os.environ.get("MZ_SERVER_THREADS", 32))
+    print(f"[INIT] waitress threads={threads} max_batch={MAX_BATCH} wait_ms={MAX_WAIT_MS}", flush=True)
+    waitress.serve(app, host="127.0.0.1", port=port, threads=threads)
 
 class Pending:
     __slots__ = ("idx", "off", "evt", "out", "req_id", "pre_count", "post_count", "t_recv", "t_done", "num_bags")

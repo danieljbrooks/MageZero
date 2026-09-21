@@ -19,6 +19,7 @@ class Opponent:
     mode: str
     version: Optional[int] = None
     offline : bool = True
+    cotrain: bool = False   # opponent uses its own network and trains on its side of the games
 
 
 @dataclass
@@ -27,6 +28,21 @@ class TrainingFlags:
     generate_plots: bool = True
     eval_previous_model: bool = True
     dense_vocab: bool = False   # size the embedding table to the features used (see vocab.py)
+
+
+@dataclass
+class JvmConfig:
+    heap: str = "24g"                     # -Xmx for the XMage JVM (non-Windows launches)
+    threads: int = 4                      # concurrent games per JVM
+    search_budget: Optional[int] = None   # overrides game.yml for both players when set
+    timeout_ms: Optional[int] = None
+
+
+@dataclass
+class EvalConfig:
+    games: int = 0                        # games per (agent, baseline) pairing; 0 disables
+    every: int = 1                        # run strength eval every N gens
+    baselines: list[str] = field(default_factory=lambda: ["offline", "frozen:0"])
 
 
 @dataclass
@@ -42,6 +58,8 @@ class RunConfig:
     log_level: str
     curriculum_path: str
     max_jvms: int = 1
+    jvm: JvmConfig = field(default_factory=JvmConfig)
+    eval: EvalConfig = field(default_factory=EvalConfig)
 
 
 @dataclass
@@ -97,8 +115,11 @@ def load_run(path: str = "configs/run.yml") -> RunConfig:
             deck=o["deck"],
             mode=mode,
             version=o.get("version"),
-            offline=o.get("offline", True)
+            offline=o.get("offline", True),
+            cotrain=o.get("cotrain", False),
         ))
+    if sum(o.cotrain for o in opponents) > 1:
+        raise ValueError("at most one opponent can set cotrain: true")
 
     log_level = raw.get("log_level", "ACTIONS")
     if log_level not in VALID_LOG_LEVELS:
@@ -118,6 +139,8 @@ def load_run(path: str = "configs/run.yml") -> RunConfig:
         log_level=log_level,
         curriculum_path=raw.get("curriculum", "configs/curriculum.yml"),
         max_jvms=raw.get("max_jvms", 1),
+        jvm=JvmConfig(**raw.get("jvm", {})),
+        eval=EvalConfig(**raw.get("eval", {})),
     )
 
 

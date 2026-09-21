@@ -32,7 +32,7 @@ OUT_DIR = None
 
 def dataloader(ds, bs=512):
     return DataLoader(
-        ds, batch_size=bs, shuffle=False, num_workers=0, pin_memory=True, collate_fn=collate_batch
+        ds, batch_size=bs, shuffle=False, num_workers=0, pin_memory=False, collate_fn=collate_batch
     )
 
 def load_ignore() -> Iterable[int] | None:

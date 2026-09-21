@@ -1,3 +1,5 @@
+import json
+import time
 from enum import Enum
 
 import torch
@@ -9,7 +11,7 @@ import gzip
 import shutil
 
 import test
-from model import NetTransformer, Net, load_model, GLOBAL_MAX, ACTIONS_MAX, PRIORITY_A_MAX, PRIORITY_B_MAX, TARGETS_MAX, BINARY_MAX, ActionType, lambda_pA, lambda_pB, lambda_t, lambda_b, normalize_policy_labels
+from model import BATCH_SIZE, policy_width, NetTransformer, Net, load_model, build_model_from_checkpoint, DEVICE, EMBED_ROWS, autocast, GLOBAL_MAX, ACTIONS_MAX, PRIORITY_A_MAX, PRIORITY_B_MAX, TARGETS_MAX, BINARY_MAX, ActionType, lambda_pA, lambda_pB, lambda_t, lambda_b, normalize_policy_labels
 from dataset import H5Indexed, collate_batch,  create_redundancy_ignore_list, filter_opponent_states
 from vocab import FeatureVocab, initial_rows, kept_feature_ids
 from pyroaring import BitMap
@@ -26,8 +28,11 @@ def train(
         use_checkpoint: bool = False,
         make_ignore_list: bool = True,
         train_opponent_head: bool = False,
+        metrics_out: str | None = None,
+        gen: int | None = None,
         dense_vocab: bool = False,
 ):
+    t_start = time.time()
     os.makedirs(f"models/{deck}/ver{version}", exist_ok=True)
     # the full-table model has one row per hash bin, so it folds ids into that range; the dense
     # vocab keys on the id XMage wrote, which may come from a wider hash space
@@ -38,16 +43,18 @@ def train(
         vocab, model = prepare_dense_vocab(deck, version, ds_raw, use_checkpoint)
         ds = H5Indexed(f"data/{deck}/ver{version}/training", vocab=vocab)
         test_ds = H5Indexed(f"data/{deck}/ver{version}/testing", vocab=vocab)
+        features_kept = len(vocab)
     else:
         vocab = None
-        model, ds, test_ds = prepare_full_table(deck, version, ds_raw, use_checkpoint, make_ignore_list)
+        model, ds, test_ds, features_kept = prepare_full_table(deck, version, ds_raw, use_checkpoint, make_ignore_list)
 
     #if round-robin filter out opponent states AFTER making the ignore list
     if not train_opponent_head:
         ds = filter_opponent_states(ds,TARGETS_MAX)
         test_ds = filter_opponent_states(test_ds,TARGETS_MAX)
 
-    train_loop(deck, version, epochs, steps, model, ds, test_ds, vocab)
+    train_loop(deck, version, epochs, steps, model, ds, test_ds, vocab,
+               metrics_out=metrics_out, gen=gen, t_start=t_start, features_kept=features_kept)
 
 
 def prepare_dense_vocab(deck: str, version: int, ds_raw: H5Indexed, use_checkpoint: bool):
@@ -82,7 +89,10 @@ def prepare_dense_vocab(deck: str, version: int, ds_raw: H5Indexed, use_checkpoi
             model.embedding.weight.copy_(torch.from_numpy(initial_rows(vocab.ids, dim)))
     print(f"feature vocab: {len(kept)} kept ids in this dataset, {prev_rows} rows from checkpoint, "
           f"{added} added -> {len(vocab)} embedding rows")
-    return vocab, model.cuda()
+    if policy_width(model) != ACTIONS_MAX:
+        raise SystemExit(f"checkpoint policy heads are {policy_width(model)} wide but "
+                         f"this run uses {ACTIONS_MAX} (check MZ_ACTION_VOCAB)")
+    return vocab, model.to(DEVICE)
 
 
 def prepare_full_table(deck: str, version: int, ds_raw: H5Indexed, use_checkpoint: bool, make_ignore_list: bool):
@@ -92,7 +102,7 @@ def prepare_full_table(deck: str, version: int, ds_raw: H5Indexed, use_checkpoin
     ignore_list = create_redundancy_ignore_list(ds_raw)
 
     # model and data loaders
-    model = NetTransformer().cuda()
+    model = NetTransformer().to(DEVICE)
 
     # optional start point
     if use_checkpoint:
@@ -100,7 +110,7 @@ def prepare_full_table(deck: str, version: int, ds_raw: H5Indexed, use_checkpoin
         try:
             #checkpoint = torch.load(checkpoint_path, map_location="cuda")
             checkpoint = load_model(checkpoint_path)
-            model.load_state_dict(checkpoint['model_state_dict'])
+            model = build_model_from_checkpoint(checkpoint).to(DEVICE)
             with open(f"models/{deck}/ver{version}/ignore.roar", "rb") as f:
                 ignore_list2 = BitMap.deserialize(f.read())
                 ignore_list.intersection_update(ignore_list2)
@@ -111,6 +121,10 @@ def prepare_full_table(deck: str, version: int, ds_raw: H5Indexed, use_checkpoin
             print(f"INFO: Checkpoint file not found at {checkpoint_path}. Starting from scratch.")
         except Exception as e:
             print(f"ERROR: Could not load checkpoint. {e}. Starting from scratch.")
+
+    if policy_width(model) != ACTIONS_MAX:
+        raise SystemExit(f"checkpoint policy heads are {policy_width(model)} wide but "
+                         f"this run uses {ACTIONS_MAX} (check MZ_ACTION_VOCAB)")
 
     if not make_ignore_list: ignore_list = []
     print("Saving ignore list to ignore.roar")
@@ -123,17 +137,21 @@ def prepare_full_table(deck: str, version: int, ds_raw: H5Indexed, use_checkpoin
     ds = H5Indexed(f"data/{deck}/ver{version}/training", ignore_list, fold_bins=GLOBAL_MAX)
     test_ds = H5Indexed(f"data/{deck}/ver{version}/testing", ignore_list, fold_bins=GLOBAL_MAX)
 
-    return model, ds, test_ds
+    return model, ds, test_ds, GLOBAL_MAX - len(ignore)
 
 
-def train_loop(deck, version, epochs, steps, model, ds, test_ds, vocab):
+def train_loop(deck, version, epochs, steps, model, ds, test_ds, vocab,
+               metrics_out=None, gen=None, t_start=None, features_kept=None):
+    t_start = t_start or time.time()
 
 
-    dl = DataLoader(ds, batch_size=512, shuffle=True, num_workers=0, collate_fn=collate_batch,
-                    pin_memory=True, persistent_workers=False)
+    pin = DEVICE.type == "cuda"
+    dl = DataLoader(ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=0, collate_fn=collate_batch,
+                    pin_memory=pin, persistent_workers=False)
 
-    dl_test = DataLoader(test_ds, batch_size=512, shuffle=False, num_workers=0, collate_fn=collate_batch,
-                    pin_memory=True, persistent_workers=False)
+    dl_test = DataLoader(test_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=0, collate_fn=collate_batch,
+                    pin_memory=pin, persistent_workers=False)
+    print(f"device={DEVICE} embed_rows={model.num_embeddings} train_states={len(ds)} test_states={len(test_ds)}")
 
     test.SHOW_CONFUSION_MATRIX = False
 
@@ -147,7 +165,7 @@ def train_loop(deck, version, epochs, steps, model, ds, test_ds, vocab):
 
     mse = nn.MSELoss()
     kld = nn.KLDivLoss(reduction='batchmean')
-    scaler = torch.amp.GradScaler()
+    scaler = torch.amp.GradScaler(enabled=DEVICE.type == "cuda")
 
 
     #stats
@@ -159,18 +177,20 @@ def train_loop(deck, version, epochs, steps, model, ds, test_ds, vocab):
         total_decision_examples, total_pA_examples, total_pB_examples, total_t_examples, total_b_examples = 0,0,0,0,0
         model.train()
         step = 0
+        grad_norm_sum, grad_norm_n = 0.0, 0
+        t_epoch = time.time()
 
         for batch_indices, batch_offsets, batch_policy_labels, batch_value_labels, is_players, action_types in dl:
             # Move new input tensors to CUDA
-            batch_indices = batch_indices.cuda()
-            batch_offsets = batch_offsets.cuda()
-            batch_policy_labels = batch_policy_labels.cuda()
-            batch_value_labels = batch_value_labels.cuda()
-            is_players = is_players.cuda().squeeze(-1).to(torch.bool)
-            action_types = action_types.cuda().squeeze(-1).to(torch.long)
+            batch_indices = batch_indices.to(DEVICE)
+            batch_offsets = batch_offsets.to(DEVICE)
+            batch_policy_labels = batch_policy_labels.to(DEVICE)
+            batch_value_labels = batch_value_labels.to(DEVICE)
+            is_players = is_players.to(DEVICE).squeeze(-1).to(torch.bool)
+            action_types = action_types.to(DEVICE).squeeze(-1).to(torch.long)
 
             # Model call uses indices and offsets
-            with torch.amp.autocast('cuda'):
+            with autocast():
                 priority_logits, opponent_priority_logits, target_logits, binary_logits ,value_pred = model(batch_indices, batch_offsets)
 
 
@@ -229,6 +249,9 @@ def train_loop(deck, version, epochs, steps, model, ds, test_ds, vocab):
             #opt_sparse.step()
             #opt_dense.step()
             scaler.scale(loss).backward()
+            scaler.unscale_(opt_dense)
+            grad_norm_sum += float(torch.nn.utils.clip_grad_norm_(model.parameters(), float("inf")))
+            grad_norm_n += 1
             scaler.step(opt_dense)
             scaler.update()
 
@@ -249,8 +272,19 @@ def train_loop(deck, version, epochs, steps, model, ds, test_ds, vocab):
         print(f"Epoch {epoch}  priority_A_loss={avg_pA_loss:.3f}  priority_B_loss={avg_pB_loss:.3f} choose_target_loss={avg_t_loss:.3f} choose_use_loss={avg_b_loss:.3f} value_loss={avg_v_loss:.3f} "
               f"l1_dense={avg_l1_dense_loss} l1_sparse={avg_l1_sparse_loss} decision_states={total_decision_examples}")
         #run current model on testing set (if there is one)
+        epoch_record = {
+            "kind": "train_epoch", "deck": deck, "version": version, "gen": gen, "epoch": epoch,
+            "train_priority_A_loss": avg_pA_loss, "train_priority_B_loss": avg_pB_loss,
+            "train_choose_target_loss": avg_t_loss, "train_choose_use_loss": avg_b_loss,
+            "train_value_loss": avg_v_loss, "train_states": len(ds), "test_states": len(test_ds),
+            "decision_states": total_decision_examples, "steps": step,
+            "grad_norm": grad_norm_sum / max(grad_norm_n, 1), "epoch_seconds": time.time() - t_epoch,
+            "features_kept": features_kept, "embed_rows": model.num_embeddings,
+        }
         if len(test_ds)>0:
-            val_loss = test.validate(model, dl_test)
+            val_metrics = test.validate(model, dl_test)
+            val_loss = val_metrics["avg_total_loss"]
+            epoch_record.update({f"val_{k}": v for k, v in val_metrics.items()})
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
                 checkpoint_save_path = f"models/{deck}/ver{version}/best.pt.gz"
@@ -263,6 +297,7 @@ def train_loop(deck, version, epochs, steps, model, ds, test_ds, vocab):
                     'optimizer_dense_state_dict': opt_dense.state_dict(),
                     'avg_p_loss': avg_pA_loss,
                     'avg_v_loss': avg_v_loss,
+                    'embed_rows': model.num_embeddings,
                     **({'feature_vocab': vocab.state_dict()} if vocab is not None else {}),
                 }, temp_path)
 
@@ -284,6 +319,7 @@ def train_loop(deck, version, epochs, steps, model, ds, test_ds, vocab):
             'optimizer_dense_state_dict': opt_dense.state_dict(),
             'avg_p_loss': avg_pA_loss,
             'avg_v_loss': avg_v_loss,
+            'embed_rows': model.num_embeddings,
             **({'feature_vocab': vocab.state_dict()} if vocab is not None else {}),
         }, temp_path)
 
@@ -293,6 +329,15 @@ def train_loop(deck, version, epochs, steps, model, ds, test_ds, vocab):
                 shutil.copyfileobj(f_in, f_out, length=16 * 1024 * 1024)  # 16MB chunks
 
         os.remove(temp_path)
+        test.append_metrics(metrics_out, epoch_record)
+
+    # keep a frozen copy per generation so later gens can be evaluated against it
+    if gen is not None:
+        model_dir = f"models/{deck}/ver{version}"
+        shutil.copy(f"{model_dir}/model.pt.gz", f"{model_dir}/gen{gen}.pt.gz")
+        if vocab is None:  # dense-vocab checkpoints carry their vocab inside
+            shutil.copy(f"{model_dir}/ignore.roar", f"{model_dir}/gen{gen}.ignore.roar")
+    print(f"train finished in {time.time() - t_start:.1f}s")
 
 if __name__ == "__main__":
     import argparse
@@ -300,9 +345,13 @@ if __name__ == "__main__":
     parser.add_argument("--deck", required=True)
     parser.add_argument("--version", type=int, default=1)
     parser.add_argument("--epochs", type=int, default=1)
-    parser.add_argument("--steps", type=int, default=15000)
+    # MZ_MAX_STEPS caps optimizer steps per epoch (training on MPS is ~16 s/step at batch 32)
+    parser.add_argument("--steps", type=int, default=int(os.environ.get("MZ_MAX_STEPS", 15000)))
     parser.add_argument("--checkpoint", action="store_true")
+    parser.add_argument("--metrics-out", default=None)
+    parser.add_argument("--gen", type=int, default=None)
     parser.add_argument("--dense-vocab", action="store_true",
                         help="size the embedding table to the features actually used (see vocab.py)")
     args = parser.parse_args()
-    train(args.deck, args.version, args.epochs, args.steps, args.checkpoint, dense_vocab=args.dense_vocab)
+    train(args.deck, args.version, args.epochs, args.steps, args.checkpoint,
+          metrics_out=args.metrics_out, gen=args.gen, dense_vocab=args.dense_vocab)

@@ -23,7 +23,8 @@ from magezero import runner
 
 def cmd_train(args: argparse.Namespace) -> None:
     run_cfg, cur_cfg = load_all(args.run)
-    runner.run_pipeline(run_cfg, cur_cfg, base_game_yml=args.game)
+    resume = True if args.resume else False if args.fresh else None
+    runner.run_pipeline(run_cfg, cur_cfg, base_game_yml=args.game, resume=resume)
 
 
 # ─── batch ───────────────────────────────────────────────────
@@ -47,19 +48,19 @@ def cmd_play(args: argparse.Namespace) -> None:
     if version is None:
         version = runner.latest_version(deck)
     server = None
-    if version is None or not runner.has_checkpoint(deck, version):
-    #if not runner.has_checkpoint(deck, version):
+    checkpoint = args.checkpoint  # e.g. "gen0" to play a specific generation instead of the latest
+    if version is None or not runner.has_checkpoint(deck, version, checkpoint):
         print(f"model for {deck} is not found, falling back to offline MCTS")
-        #sys.exit(f"no checkpoint at models/{deck}/ver{version}/model.pt.gz")
     else:
         # start inference server
-        print(f"[play] starting inference server for {deck} v{version}")
-        server = runner.start_server(deck, version, runner.PRIMARY_PORT, Path("."))
+        label = f"{deck} v{version}" + (f" {checkpoint}" if checkpoint else " (latest)")
+        print(f"[play] starting inference server for {label}")
+        server = runner.start_server(deck, version, runner.PRIMARY_PORT, Path("."), checkpoint=checkpoint)
 
     try:
         # launch XMage server
         script = "xmage\\mz-xmage-play.bat" if sys.platform == "win32" else "xmage/mz-xmage-play.sh"
-        cmd = ["cmd", "/c", script, str(config)] if sys.platform == "win32" else [script, str(config)]
+        cmd = ["cmd", "/c", script, str(config)] if sys.platform == "win32" else ["sh", script, str(config)]
         subprocess.run(cmd, check=True)
     finally:
         if server is not None:
@@ -133,6 +134,8 @@ def main() -> None:
     p_train = sub.add_parser("train", help="full curriculum pipeline")
     p_train.add_argument("--run", default="configs/run.yml")
     p_train.add_argument("--game", default="configs/game.yml")
+    p_train.add_argument("--resume", action="store_true", help="resume an active run without prompting")
+    p_train.add_argument("--fresh", action="store_true", help="abandon any active run without prompting")
     p_train.set_defaults(func=cmd_train)
 
     p_batch = sub.add_parser("batch", help="single JVM launch")
@@ -143,6 +146,8 @@ def main() -> None:
     p_play.add_argument("--deck", required=True)
     p_play.add_argument("--version", type=int, default=None)
     p_play.add_argument("--config", default="configs/game.yml")
+    p_play.add_argument("--checkpoint", default=None,
+                        help="frozen snapshot to play against, e.g. gen0 (default: latest model)")
     p_play.set_defaults(func=cmd_play)
 
     p_import = sub.add_parser("import", help="import .dck or .mz file")

@@ -1,3 +1,5 @@
+import contextlib
+import os
 import torch
 from torch import nn
 import math
@@ -14,15 +16,75 @@ Policy heads are for each decision type (disjoint action spaces) they are:
 128D Choose Target (target choices for both players)
 2D Choose Use (binary decisions for either player - this is used for selecting attackers and blockers)
 """
-ACTIONS_MAX = 128
+
+
+def _action_dim() -> int:
+    """Policy head width. Upstream hashes actions into 128 slots; a set vocabulary
+    (MZ_ACTION_VOCAB, see experiments/action_vocab/README.md) gives every action in the set its
+    own slot and declares the width on its `dim` line. The JVM reads the same file, so both
+    sides agree. Checkpoints carry their own width (see build_model_from_checkpoint)."""
+    path = os.environ.get("MZ_ACTION_VOCAB")
+    if path:
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                if line.startswith("dim\t"):
+                    return int(line.split("\t")[1])
+        raise ValueError(f"no dim line in action vocabulary {path}")
+    return 128
+
+
+ACTIONS_MAX = _action_dim()
 GLOBAL_MAX = 2000000
 
+# Rows in the dense embedding table. Raw feature ids (0..GLOBAL_MAX) are folded into this
+# many rows with a modulo. The 2M default needs ~12 GB for weights + Adam state, so smaller
+# machines can set MZ_EMBED_ROWS (e.g. 262144) at the cost of a few % hash collisions.
+EMBED_ROWS = int(os.environ.get("MZ_EMBED_ROWS", GLOBAL_MAX))
+
+# States carry ~1-2k tokens before the ignore list prunes them, and attention memory grows
+# with batch * tokens^2: 512 fits a large CUDA card, Apple unified memory needs ~32.
+BATCH_SIZE = int(os.environ.get("MZ_BATCH_SIZE", 512))
+
+# Round padded sequence length up to a multiple of this. Padding is masked out, so outputs are
+# unchanged; on MPS it avoids per-shape kernel rebuilds (~20 s/step -> ~6 s/step measured).
+PAD_BUCKET = int(os.environ.get("MZ_PAD_BUCKET", 1))
 
 
-PRIORITY_A_MAX = 128
-PRIORITY_B_MAX = 128
-TARGETS_MAX = 128
+def pick_device() -> torch.device:
+    """MZ_DEVICE overrides; otherwise CUDA, then Apple MPS, then CPU."""
+    forced = os.environ.get("MZ_DEVICE")
+    if forced:
+        return torch.device(forced)
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
+
+
+DEVICE = pick_device()
+if DEVICE.type == "mps":
+    # nn.TransformerEncoder's eval-mode fast path uses nested-tensor ops MPS lacks; with
+    # PYTORCH_ENABLE_MPS_FALLBACK=1 they silently run on CPU, so use the regular path instead.
+    torch.backends.mha.set_fastpath_enabled(False)
+
+
+def autocast():
+    """Mixed precision on CUDA only; a no-op elsewhere."""
+    if DEVICE.type == "cuda":
+        return torch.amp.autocast("cuda")
+    return contextlib.nullcontext()
+
+
+
+PRIORITY_A_MAX = ACTIONS_MAX
+PRIORITY_B_MAX = ACTIONS_MAX
+TARGETS_MAX = ACTIONS_MAX
 BINARY_MAX = 2
+
+# Loss weights are ln2/ln(K) per head. K stays at the upstream 128 when the heads widen, so a
+# vocabulary run weighs policy vs value loss the same way as a 128-slot run (MZ_LOSS_K overrides).
+LOSS_K = int(os.environ.get("MZ_LOSS_K", 128))
 
 
 class ActionType(Enum):
@@ -40,9 +102,9 @@ def head_weight(K: int) -> float:
     return math.log(2.0) / math.log(float(K))
 
 #per head weights
-lambda_pA = head_weight(PRIORITY_A_MAX)
-lambda_pB = head_weight(PRIORITY_B_MAX)
-lambda_t = head_weight(TARGETS_MAX)
+lambda_pA = head_weight(LOSS_K)
+lambda_pB = head_weight(LOSS_K)
+lambda_t = head_weight(LOSS_K)
 lambda_b = head_weight(BINARY_MAX)
 
 
@@ -132,8 +194,11 @@ class Net(nn.Module):
         #return self.player_priority_head(h), self.opponent_priority_head(h), self.target_head(h), self.binary_head(h), self.value_head(h).squeeze(-1)
 
 class NetTransformer(nn.Module):
-    def __init__(self, num_embeddings=GLOBAL_MAX, policy_size_A=ACTIONS_MAX):
+    def __init__(self, num_embeddings=None, policy_size_A=ACTIONS_MAX):
         super().__init__()
+        if num_embeddings is None:
+            num_embeddings = EMBED_ROWS
+        self.num_embeddings = num_embeddings
 
         embedding_dim = 512
         hidden_dim_mlp = 256
@@ -212,10 +277,24 @@ class NetTransformer(nn.Module):
         self.embedding = new
 
     def forward(self, indices, offsets):
+        indices = indices % self.num_embeddings
         B = offsets.shape[0]
         ends = torch.cat([offsets[1:], torch.tensor([indices.shape[0]], device=offsets.device)])
         lengths = ends - offsets
+
+        if self.training and self.input_dropout > 0:
+            # Token dropout by removing tokens rather than masking them: dropped tokens never
+            # entered attention or pooling anyway, so this is equivalent but the padded batch is
+            # ~30% shorter, which roughly halves attention memory.
+            bag = torch.repeat_interleave(torch.arange(B, device=indices.device), lengths)
+            keep = torch.rand(indices.shape[0], device=indices.device) >= self.input_dropout
+            indices, bag = indices[keep], bag[keep]
+            lengths = torch.bincount(bag, minlength=B)
+            offsets = torch.cumsum(lengths, 0) - lengths
         max_len = lengths.max().item()
+        if PAD_BUCKET > 1:
+            # a handful of fixed shapes instead of a new one per batch (MPS recompiles per shape)
+            max_len = -(-max_len // PAD_BUCKET) * PAD_BUCKET
 
         # reconstruct padded sequences
         padded = indices.new_zeros(B, max_len)
@@ -225,10 +304,6 @@ class NetTransformer(nn.Module):
             l = lengths[i]
             padded[i, :l] = indices[offsets[i]:offsets[i] + l]
             mask[i, :l] = True
-
-        if self.training and self.input_dropout > 0:
-            drop = torch.rand(B, max_len, device=indices.device) < self.input_dropout
-            mask = mask & ~drop  # removed from attention
 
 
         emb = self.embedding(padded)  # (B, max_len, 512)
@@ -257,8 +332,26 @@ class NetTransformer(nn.Module):
 def load_model(path):
     if path.endswith('.gz'):
         with gzip.open(path, 'rb') as f:
-            return torch.load(f)
-    return torch.load(path)
+            return torch.load(f, map_location="cpu")
+    return torch.load(path, map_location="cpu")
+
+
+def build_model_from_checkpoint(ckpt: dict) -> "NetTransformer":
+    """Rebuild a NetTransformer sized to match the checkpoint's embedding table."""
+    sd = ckpt["model_state_dict"]
+    rows = ckpt.get("embed_rows") or sd["embedding.weight"].shape[0]
+    # the head's last Linear sets the policy width (128 upstream, the vocab dim otherwise)
+    head_keys = sorted((k for k in sd if k.startswith("player_priority_head.") and k.endswith(".weight")),
+                       key=lambda k: int(k.split(".")[1]) if k.split(".")[1].isdigit() else 0)
+    model = NetTransformer(num_embeddings=rows, policy_size_A=sd[head_keys[-1]].shape[0])
+    model.load_state_dict(ckpt["model_state_dict"])
+    return model
+
+def policy_width(model) -> int:
+    """Width of the priority/opponent/target heads (their final Linear layer)."""
+    head = model.player_priority_head
+    return head[-1].out_features if isinstance(head, nn.Sequential) else head.out_features
+
 
 def normalize_policy_labels(raw: torch.Tensor) -> torch.Tensor:
     total = raw.sum(dim=1, keepdim=True).clamp(min=1e-8)

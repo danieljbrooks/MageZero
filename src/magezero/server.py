@@ -8,19 +8,17 @@ import waitress
 from pyroaring import BitMap
 from flask import Flask, request, Response
 import msgpack
-from model import NetTransformer, Net, load_model, GLOBAL_MAX, ACTIONS_MAX
+from model import load_model, build_model_from_checkpoint, policy_width, autocast, DEVICE, GLOBAL_MAX, ACTIONS_MAX
 from vocab import FeatureVocab
-
-# Device setup
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # Threading config
 TORCH_THREADS = 1 #max(1, os.cpu_count() // 2)
 torch.set_num_threads(TORCH_THREADS)
 
-# Batching config
-MAX_BATCH = 16
-MAX_WAIT_MS = 0
+# Batching config: after the first queued request, wait up to MAX_WAIT_MS for more so several
+# game threads share one forward pass (per-call overhead dominates on small batches).
+MAX_BATCH = int(os.environ.get("MZ_MAX_BATCH", 16))
+MAX_WAIT_MS = float(os.environ.get("MZ_BATCH_WAIT_MS", 0))
 
 #module state
 server_model = None
@@ -33,29 +31,65 @@ app = Flask(__name__)
 req_counter = 0
 req_counter_lock = threading.Lock()
 
-def init(deck: str, version: int, port: int):
+STATS = {"reqs": 0, "bags": 0, "batches": 0, "lat_ms": [], "value_sum": 0.0}
+STATS_LOCK = threading.Lock()
+STATS_EVERY_S = 30
+
+
+def stats_loop():
+    """Print one aggregate line per interval instead of a line per request."""
+    while True:
+        time.sleep(STATS_EVERY_S)
+        with STATS_LOCK:
+            snap = dict(STATS); lat = sorted(STATS["lat_ms"])
+            STATS.update(reqs=0, bags=0, batches=0, lat_ms=[], value_sum=0.0)
+        if not snap["reqs"]:
+            continue
+        p50 = lat[len(lat) // 2]; p95 = lat[int(len(lat) * 0.95)]
+        print(f"[STATS] window_s={STATS_EVERY_S} reqs={snap['reqs']} bags={snap['bags']} "
+              f"avg_batch={snap['bags'] / max(snap['batches'], 1):.2f} p50_ms={p50:.1f} p95_ms={p95:.1f} "
+              f"value_mean={snap['value_sum'] / max(snap['bags'], 1):.3f}", flush=True)
+
+
+def init(deck: str, version: int, port: int, checkpoint: str | None = None):
     global server_model, IGNORE_BM, VALID_RANGE, VOCAB
 
     model_dir = f"models/{deck}/ver{version}"
     ignore_path = f"{model_dir}/ignore.roar"
     model_path = f"{model_dir}/model.pt.gz"
+    if checkpoint:  # e.g. "gen2" -> frozen snapshot written by train.py
+        ignore_path = f"{model_dir}/{checkpoint}.ignore.roar"
+        model_path = f"{model_dir}/{checkpoint}.pt.gz"
 
     ckpt = load_model(model_path)
     if "feature_vocab" in ckpt:
         # dense vocab: ids are mapped to rows; ids outside the vocab are the ignored ones
         VOCAB = FeatureVocab.from_state_dict(ckpt["feature_vocab"])
+        # rows only mean anything under the encoding that built them
         VOCAB.require_encoding(GLOBAL_MAX)
-        server_model = NetTransformer(len(VOCAB), ACTIONS_MAX).to(DEVICE).eval()
     else:
         with open(ignore_path, "rb") as f:
             IGNORE_BM = BitMap.deserialize(f.read())
         VALID_RANGE = BitMap(range(GLOBAL_MAX))
-        server_model = NetTransformer(GLOBAL_MAX, ACTIONS_MAX).to(DEVICE).eval()
-    server_model.load_state_dict(ckpt["model_state_dict"])
+    server_model = build_model_from_checkpoint(ckpt).to(DEVICE).eval()
+    head = policy_width(server_model)
+    if head != ACTIONS_MAX:
+        # the JVM indexes these logits with its own ActionEncoder; a width mismatch would
+        # silently point priors at the wrong actions
+        raise SystemExit(f"model {model_path} has {head}-wide policy heads but this run uses "
+                         f"{ACTIONS_MAX} (MZ_ACTION_VOCAB={os.environ.get('MZ_ACTION_VOCAB')})")
+    if os.environ.get("MZ_INFER_PAD_BUCKET"):
+        # inference sees one shape per request anyway; finer buckets waste less compute on padding
+        import model as _model
+        _model.PAD_BUCKET = int(os.environ["MZ_INFER_PAD_BUCKET"])
+    if os.environ.get("MZ_INFER_DTYPE") == "float16":
+        # inference-only half precision: same weights, ~half the GPU work (see experiments/fdn/README)
+        server_model = server_model.half()
 
     threading.Thread(target=worker_loop, daemon=True).start()
+    threading.Thread(target=stats_loop, daemon=True).start()
 
-    print(f"[INIT] deck={deck} ver={version} port={port} device={DEVICE}")
+    print(f"[INIT] deck={deck} ver={version} model={model_path} port={port} device={DEVICE} action_dim={head}", flush=True)
     waitress.serve(app, host="127.0.0.1", port=port, threads=6)
 
 class Pending:
@@ -150,8 +184,9 @@ def worker_loop():
 
         if VOCAB is None:
             idx = idx % GLOBAL_MAX   # raw feature ids; dense-vocab rows are already < len(VOCAB)
-        # Single forward pass
-        with torch.no_grad(), torch.amp.autocast('cuda'):
+        # Single forward pass. autocast() comes from model.py and picks the right device:
+        # torch.amp.autocast('cuda') would break every CPU/MPS worker.
+        with torch.no_grad(), autocast():
             pA, pB, tgt, bin2, val = server_model(idx, off)
 
         # Move to CPU once
@@ -187,7 +222,10 @@ def worker_loop():
             p.t_done = time.perf_counter()
             p.evt.set()
 
-        print(f"[BATCH] size={len(batch)}, total_bag_size={row}")
+        with STATS_LOCK:
+            STATS["batches"] += 1
+            STATS["bags"] += row
+            STATS["value_sum"] += float(val[:row].float().sum())
 
 
 #threading.Thread(target=worker_loop, daemon=True).start()
@@ -205,13 +243,12 @@ def evaluate():
     offsets = data.get("offsets", [])
     pending = Pending(req_counter, indices, offsets)
 
-    print(f"[REQ {pending.req_id}] indices={pending.pre_count}, kept={pending.post_count}, bag_size={pending.num_bags}")
-
     Q.put(pending)
     pending.evt.wait()
 
-    total_ms = (pending.t_done - pending.t_recv) * 1000.0
-    print(f"[REQ {pending.req_id}] done: {total_ms:.1f}ms")
+    with STATS_LOCK:
+        STATS["reqs"] += 1
+        STATS["lat_ms"].append((pending.t_done - pending.t_recv) * 1000.0)
 
     return Response(msgpack.packb(pending.out, use_bin_type=True), mimetype="application/x-msgpack")
 
@@ -228,5 +265,6 @@ if __name__ == "__main__":
     parser.add_argument("--deck", required=True)
     parser.add_argument("--version", type=int, required=True)
     parser.add_argument("--port", type=int, default=50052)
+    parser.add_argument("--checkpoint", default=None, help="frozen snapshot name, e.g. gen2")
     args = parser.parse_args()
-    init(args.deck, args.version, args.port)
+    init(args.deck, args.version, args.port, args.checkpoint)

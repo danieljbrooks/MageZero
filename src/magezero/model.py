@@ -275,6 +275,12 @@ class NetTransformer(nn.Module):
                 new.weight[old.num_embeddings:] = torch.as_tensor(
                     init_rows, dtype=new.weight.dtype, device=new.weight.device)[:added]
         self.embedding = new
+        # Keep num_embeddings in sync with the table. forward() does `indices % num_embeddings`,
+        # so a stale value silently wraps the newly added rows onto old ones -- the vocab grows
+        # but the model cannot reach the new features. It also travels into the checkpoint as
+        # embed_rows; build_model_from_checkpoint sizes from the weights regardless, but this is
+        # the actual root cause of that mismatch.
+        self.num_embeddings = num_embeddings
 
     def forward(self, indices, offsets):
         indices = indices % self.num_embeddings

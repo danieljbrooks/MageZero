@@ -12,7 +12,13 @@ from model import load_model, build_model_from_checkpoint, policy_width, autocas
 from vocab import FeatureVocab
 
 # Threading config
-TORCH_THREADS = 1 #max(1, os.cpu_count() // 2)
+# CPU-side intra-op parallelism. The forward pass runs on the GPU, so this governs only the
+# collate step: torch.cat, the offset arithmetic and the host->device copy. Raising it helps
+# only in so far as that step is inside torch kernels rather than Python, and on a box whose
+# cores are already saturated by game threads it takes them from self-play. Measure with the
+# [PHASE] line below before changing it. os.cpu_count() reports the HOST's cores on a
+# container, so never derive this from it.
+TORCH_THREADS = int(os.environ.get("MZ_TORCH_THREADS", 1))
 torch.set_num_threads(TORCH_THREADS)
 
 # Batching config: after the first queued request, wait up to MAX_WAIT_MS for more so several
@@ -32,6 +38,11 @@ req_counter = 0
 req_counter_lock = threading.Lock()
 
 STATS = {"reqs": 0, "bags": 0, "batches": 0, "lat_ms": [], "value_sum": 0.0}
+# Where a batch's wall time actually goes. collate is the only part MZ_TORCH_THREADS can
+# touch; if forward dominates, more threads cannot help, and if neither does the time is
+# Python under the GIL and more threads still cannot help.
+PHASE = {"n": 0, "collect": 0.0, "collate": 0.0, "forward": 0.0, "batch": 0}
+PHASE_LOCK = threading.Lock()
 STATS_LOCK = threading.Lock()
 STATS_EVERY_S = 30
 
@@ -49,6 +60,17 @@ def stats_loop():
         print(f"[STATS] window_s={STATS_EVERY_S} reqs={snap['reqs']} bags={snap['bags']} "
               f"avg_batch={snap['bags'] / max(snap['batches'], 1):.2f} p50_ms={p50:.1f} p95_ms={p95:.1f} "
               f"value_mean={snap['value_sum'] / max(snap['bags'], 1):.3f}", flush=True)
+        with PHASE_LOCK:
+            ph = dict(PHASE)
+            PHASE.update(n=0, collect=0.0, collate=0.0, forward=0.0, batch=0)
+        if ph["n"]:
+            n = ph["n"]
+            tot = (ph["collect"] + ph["collate"] + ph["forward"]) / n * 1000
+            print(f"[PHASE] threads={TORCH_THREADS} batches={n} avg_batch={ph['batch']/n:.1f} "
+                  f"collect_ms={ph['collect']/n*1000:.1f} collate_ms={ph['collate']/n*1000:.1f} "
+                  f"forward_ms={ph['forward']/n*1000:.1f} total_ms={tot:.1f} "
+                  f"collate_share={100*ph['collate']/max(ph['collect']+ph['collate']+ph['forward'],1e-9):.0f}%",
+                  flush=True)
 
 
 def init(deck: str, version: int, port: int, checkpoint: str | None = None):
@@ -155,6 +177,7 @@ Q: "Queue[Pending]" = Queue(maxsize=4096)
 def worker_loop():
     while True:
         p0 = Q.get()
+        t_start = time.perf_counter()
         batch = [p0]
 
         # Collect more requests up to MAX_BATCH or MAX_WAIT_MS
@@ -170,6 +193,7 @@ def worker_loop():
             except Empty:
                 break
 
+        t_collected = time.perf_counter()
         bag_counts = [p.num_bags for p in batch]
 
         # Fast path: single request
@@ -190,6 +214,7 @@ def worker_loop():
             )
             off = (all_off + adjustments).to(DEVICE, non_blocking=True)
 
+        t_collated = time.perf_counter()
         if VOCAB is None:
             idx = idx % GLOBAL_MAX   # raw feature ids; dense-vocab rows are already < len(VOCAB)
         # Single forward pass. autocast() comes from model.py and picks the right device:
@@ -203,6 +228,15 @@ def worker_loop():
         tgt = tgt.cpu()
         bin2 = bin2.cpu()
         val = val.cpu()
+
+        # .cpu() above forces a device sync, so t_forward genuinely covers the GPU work
+        t_forward = time.perf_counter()
+        with PHASE_LOCK:
+            PHASE["n"] += 1
+            PHASE["collect"] += t_collected - t_start
+            PHASE["collate"] += t_collated - t_collected
+            PHASE["forward"] += t_forward - t_collated
+            PHASE["batch"] += len(batch)
 
         # Split results back to individual requests
         row = 0

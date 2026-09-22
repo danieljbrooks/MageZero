@@ -339,7 +339,13 @@ def load_model(path):
 def build_model_from_checkpoint(ckpt: dict) -> "NetTransformer":
     """Rebuild a NetTransformer sized to match the checkpoint's embedding table."""
     sd = ckpt["model_state_dict"]
-    rows = ckpt.get("embed_rows") or sd["embedding.weight"].shape[0]
+    # The saved embedding tensor is the ground truth for its own size. The embed_rows
+    # metadata can be stale -- model.num_embeddings is not updated when the embedding table
+    # is resized as the feature vocab grows across generations, so a checkpoint can carry
+    # embed_rows=10700 while its actual embedding is 14518 rows. Trusting the metadata built
+    # a wrong-size model and made every inference-server start past that generation die on
+    # load_state_dict (size mismatch). The weights never lie, so size from them.
+    rows = sd["embedding.weight"].shape[0]
     # the head's last Linear sets the policy width (128 upstream, the vocab dim otherwise)
     head_keys = sorted((k for k in sd if k.startswith("player_priority_head.") and k.endswith(".weight")),
                        key=lambda k: int(k.split(".")[1]) if k.split(".")[1].isdigit() else 0)

@@ -9,7 +9,7 @@ import gzip
 import shutil
 
 import test
-from model import NetTransformer, load_model, DEVICE, GLOBAL_MAX, PRIORITY_A_MAX, PRIORITY_B_MAX, TARGETS_MAX, BINARY_MAX, ActionType, lambda_pA, lambda_pB, lambda_t, lambda_b, normalize_policy_labels
+from model import NetTransformer, load_model, require_policy_width, DEVICE, GLOBAL_MAX, PRIORITY_A_MAX, PRIORITY_B_MAX, TARGETS_MAX, BINARY_MAX, ActionType, lambda_pA, lambda_pB, lambda_t, lambda_b, normalize_policy_labels
 from dataset import H5Indexed, collate_batch, filter_opponent_states
 from vocab import FeatureVocab, initial_rows, kept_feature_ids
 
@@ -55,6 +55,7 @@ def prepare_dense_vocab(deck: str, version: int, use_checkpoint: bool):
             vocab = FeatureVocab.from_state_dict(checkpoint["feature_vocab"])
             vocab.require_encoding(GLOBAL_MAX)
             state = checkpoint["model_state_dict"]
+            require_policy_width(state, checkpoint_path)
             print(f"Successfully loaded checkpoint from {checkpoint_path}")
         except FileNotFoundError:
             print(f"INFO: Checkpoint file not found at {checkpoint_path}. Starting from scratch.")

@@ -6,7 +6,7 @@ from torch.utils.data import DataLoader
 
 from dataset import H5Indexed, collate_batch, filter_opponent_states
 from vocab import FeatureVocab
-from model import NetTransformer, load_model, DEVICE, GLOBAL_MAX, PRIORITY_A_MAX, PRIORITY_B_MAX, TARGETS_MAX, BINARY_MAX, ActionType, lambda_pA, lambda_pB, lambda_t, lambda_b, normalize_policy_labels
+from model import NetTransformer, load_model, require_policy_width, DEVICE, GLOBAL_MAX, PRIORITY_A_MAX, PRIORITY_B_MAX, TARGETS_MAX, BINARY_MAX, ActionType, lambda_pA, lambda_pB, lambda_t, lambda_b, normalize_policy_labels
 
 SHOW_CONFUSION_MATRIX = True
 
@@ -187,6 +187,10 @@ if __name__ == "__main__":
     except FileNotFoundError:
         checkpoint = None
         print(f"ERROR: Checkpoint not found at {checkpoint_path}. Testing with uninitialized model.")
+
+    if checkpoint is not None:
+        # fail loudly: the load below falls back to an untrained model on any error
+        require_policy_width(checkpoint["model_state_dict"], checkpoint_path)
 
     vocab = None
     if checkpoint is not None and "feature_vocab" in checkpoint:

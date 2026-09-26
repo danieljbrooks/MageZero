@@ -7,7 +7,7 @@ import torch
 import waitress
 from flask import Flask, request, Response
 import msgpack
-from model import NetTransformer, load_model, GLOBAL_MAX
+from model import NetTransformer, load_model, require_policy_width, GLOBAL_MAX, ACTION_DIM
 from vocab import FeatureVocab
 
 # Device setup
@@ -40,6 +40,7 @@ def init(deck: str, version: int, port: int):
         # dense vocab: ids are mapped to rows; ids outside the vocab are the ignored ones
         VOCAB = FeatureVocab.from_state_dict(ckpt["feature_vocab"])
         VOCAB.require_encoding(GLOBAL_MAX)
+        require_policy_width(ckpt["model_state_dict"], model_path)
         server_model = NetTransformer(len(VOCAB)).to(DEVICE).eval()
     else:
         raise ValueError("old checkpoint version")
@@ -47,7 +48,7 @@ def init(deck: str, version: int, port: int):
 
     threading.Thread(target=worker_loop, daemon=True).start()
 
-    print(f"[INIT] deck={deck} ver={version} port={port} device={DEVICE}")
+    print(f"[INIT] deck={deck} ver={version} port={port} device={DEVICE} action_dim={ACTION_DIM}")
     waitress.serve(app, host="127.0.0.1", port=port, threads=6)
 
 class Pending:

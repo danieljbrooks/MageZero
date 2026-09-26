@@ -1,3 +1,4 @@
+import os
 import torch
 from torch import nn
 import math
@@ -9,11 +10,13 @@ MageZero Neural Network architecture for AlphaZero style MCTS:
 2M x 512 embedding table (sparse indices -> ~1300 tokens)
 └── 2-layer TransformerEncoder (d=512, nhead=4, ff=1024)
     └── mean pool -> 512D
-        ├── MLP(512 -> 256 -> 128)  priority_player   (PlayerA priority actions)
-        ├── MLP(512 -> 256 -> 128)  priority_opponent (PlayerB priority actions)
-        ├── MLP(512 -> 256 -> 128)  target            (target choices, both players)
+        ├── MLP(512 -> 256 -> A)    priority_player   (PlayerA priority actions)
+        ├── MLP(512 -> 256 -> A)    priority_opponent (PlayerB priority actions)
+        ├── MLP(512 -> 256 -> A)    target            (target choices, both players)
         ├── MLP(512 -> 256 -> 2)    binary            (attack/block use decisions)
         └── MLP(512 -> 256 -> 1)    value             (tanh, -1..1)
+
+A, the policy width, is 128 unless an action vocabulary is configured (see action_dim).
 """
 
 
@@ -22,10 +25,31 @@ GLOBAL_MAX = 2**31-1
 # CUDA when available; otherwise train/test fall back to CPU (e.g. to smoke-test on a laptop).
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-PRIORITY_A_MAX = 128
-PRIORITY_B_MAX = 128
-TARGETS_MAX = 128
+def action_dim() -> int:
+    """Width of the priority and target heads.
+
+    128 by default, where the JVM hashes every action into 128 slots. When MZ_ACTION_VOCAB points
+    at an action vocabulary (the same file the JVM's ActionEncoder reads), the width is its
+    `dim` line, and every action listed in it gets a slot of its own. Opt-in: without the
+    variable, nothing changes."""
+    path = os.environ.get("MZ_ACTION_VOCAB")
+    if not path:
+        return 128
+    with open(path) as f:
+        for line in f:
+            if line.startswith("dim\t"):
+                return int(line.split("\t")[1])
+    raise ValueError(f"action vocabulary {path} has no 'dim' line")
+
+
+ACTION_DIM = action_dim()
+PRIORITY_A_MAX = ACTION_DIM
+PRIORITY_B_MAX = ACTION_DIM
+TARGETS_MAX = ACTION_DIM
 BINARY_MAX = 2
+# The policy heads' loss weight is ln2/ln(K). K stays 128 when the heads widen, so a wider head
+# weighs policy against value the same way a 128-slot head does. MZ_LOSS_K overrides it.
+LOSS_K = int(os.environ.get("MZ_LOSS_K", 128))
 
 
 class ActionType(Enum):
@@ -39,9 +63,9 @@ def head_weight(K: int) -> float:
     return math.log(2.0) / math.log(float(K))
 
 #per head weights
-lambda_pA = head_weight(PRIORITY_A_MAX)
-lambda_pB = head_weight(PRIORITY_B_MAX)
-lambda_t = head_weight(TARGETS_MAX)
+lambda_pA = head_weight(LOSS_K)
+lambda_pB = head_weight(LOSS_K)
+lambda_t = head_weight(LOSS_K)
 lambda_b = head_weight(BINARY_MAX)
 
 class NetTransformer(nn.Module):
@@ -146,6 +170,20 @@ class NetTransformer(nn.Module):
         )
 
 
+
+
+def checkpoint_policy_width(state_dict) -> int:
+    """Width of a checkpoint's policy heads (the final Linear of the player priority head)."""
+    return state_dict["player_priority_head.2.weight"].shape[0]
+
+
+def require_policy_width(state_dict, source: str) -> None:
+    """Refuse a checkpoint whose policy heads don't match this run's width. The JVM indexes the
+    logits with its own ActionEncoder, so a mismatch would point every prior at the wrong action."""
+    width = checkpoint_policy_width(state_dict)
+    if width != ACTION_DIM:
+        raise ValueError(f"{source} has {width}-wide policy heads, but this run uses {ACTION_DIM} "
+                         f"(MZ_ACTION_VOCAB={os.environ.get('MZ_ACTION_VOCAB') or 'unset'})")
 
 
 def load_model(path):

@@ -9,7 +9,7 @@ import gzip
 import shutil
 
 import test
-from model import NetTransformer, load_model, require_policy_width, DEVICE, GLOBAL_MAX, PRIORITY_A_MAX, PRIORITY_B_MAX, TARGETS_MAX, BINARY_MAX, ActionType, lambda_pA, lambda_pB, lambda_t, lambda_b, normalize_policy_labels
+from model import NetTransformer, load_model, require_policy_width, DEVICE, TRAIN_BATCH, GLOBAL_MAX, PRIORITY_A_MAX, PRIORITY_B_MAX, TARGETS_MAX, BINARY_MAX, ActionType, lambda_pA, lambda_pB, lambda_t, lambda_b, normalize_policy_labels
 from dataset import H5Indexed, collate_batch, filter_opponent_states
 from vocab import FeatureVocab, initial_rows, kept_feature_ids
 
@@ -79,10 +79,10 @@ def prepare_dense_vocab(deck: str, version: int, use_checkpoint: bool):
 def train_loop(deck, version, epochs, steps, model, ds, test_ds, vocab):
 
 
-    dl = DataLoader(ds, batch_size=512, shuffle=True, num_workers=0, collate_fn=collate_batch,
+    dl = DataLoader(ds, batch_size=TRAIN_BATCH, shuffle=True, num_workers=0, collate_fn=collate_batch,
                     pin_memory=True, persistent_workers=False)
 
-    dl_test = DataLoader(test_ds, batch_size=512, shuffle=False, num_workers=0, collate_fn=collate_batch,
+    dl_test = DataLoader(test_ds, batch_size=TRAIN_BATCH, shuffle=False, num_workers=0, collate_fn=collate_batch,
                     pin_memory=True, persistent_workers=False)
 
     test.SHOW_CONFUSION_MATRIX = False

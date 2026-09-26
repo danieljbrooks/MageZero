@@ -24,6 +24,9 @@ GLOBAL_MAX = 2**31-1
 
 # CUDA when available; otherwise train/test fall back to CPU (e.g. to smoke-test on a laptop).
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+# States per training/test batch. 512 by default. Long states (a format-wide game encodes
+# ~1,700 features per state) need a smaller batch to fit in GPU memory: MZ_TRAIN_BATCH.
+TRAIN_BATCH = int(os.environ.get("MZ_TRAIN_BATCH", 512))
 
 def action_dim() -> int:
     """Width of the priority and target heads.

@@ -9,7 +9,7 @@ import gzip
 import shutil
 
 import test
-from model import NetTransformer, load_model, GLOBAL_MAX, PRIORITY_A_MAX, PRIORITY_B_MAX, TARGETS_MAX, BINARY_MAX, ActionType, lambda_pA, lambda_pB, lambda_t, lambda_b, normalize_policy_labels
+from model import NetTransformer, load_model, DEVICE, GLOBAL_MAX, PRIORITY_A_MAX, PRIORITY_B_MAX, TARGETS_MAX, BINARY_MAX, ActionType, lambda_pA, lambda_pB, lambda_t, lambda_b, normalize_policy_labels
 from dataset import H5Indexed, collate_batch, filter_opponent_states
 from vocab import FeatureVocab, initial_rows, kept_feature_ids
 
@@ -71,7 +71,7 @@ def prepare_dense_vocab(deck: str, version: int, use_checkpoint: bool):
             model.embedding.weight.copy_(torch.from_numpy(initial_rows(vocab.ids, dim)))
     print(f"feature vocab: {len(kept)} kept ids in this dataset, {prev_rows} rows from checkpoint, "
           f"{added} added -> {len(vocab)} embedding rows")
-    return vocab, model.cuda()
+    return vocab, model.to(DEVICE)
 
 
 
@@ -91,7 +91,7 @@ def train_loop(deck, version, epochs, steps, model, ds, test_ds, vocab):
 
     mse = nn.MSELoss()
     kld = nn.KLDivLoss(reduction='batchmean')
-    scaler = torch.amp.GradScaler()
+    scaler = torch.amp.GradScaler(enabled=DEVICE.type == 'cuda')
 
 
     #stats
@@ -106,15 +106,15 @@ def train_loop(deck, version, epochs, steps, model, ds, test_ds, vocab):
 
         for batch_indices, batch_offsets, batch_policy_labels, batch_value_labels, is_players, action_types in dl:
             # Move new input tensors to CUDA
-            batch_indices = batch_indices.cuda()
-            batch_offsets = batch_offsets.cuda()
-            batch_policy_labels = batch_policy_labels.cuda()
-            batch_value_labels = batch_value_labels.cuda()
-            is_players = is_players.cuda().squeeze(-1).to(torch.bool)
-            action_types = action_types.cuda().squeeze(-1).to(torch.long)
+            batch_indices = batch_indices.to(DEVICE)
+            batch_offsets = batch_offsets.to(DEVICE)
+            batch_policy_labels = batch_policy_labels.to(DEVICE)
+            batch_value_labels = batch_value_labels.to(DEVICE)
+            is_players = is_players.to(DEVICE).squeeze(-1).to(torch.bool)
+            action_types = action_types.to(DEVICE).squeeze(-1).to(torch.long)
 
             # Model call uses indices and offsets
-            with torch.amp.autocast('cuda'):
+            with torch.amp.autocast(DEVICE.type, enabled=DEVICE.type == 'cuda'):
                 priority_logits, opponent_priority_logits, target_logits, binary_logits ,value_pred = model(batch_indices, batch_offsets)
 
 

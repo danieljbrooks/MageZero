@@ -19,6 +19,9 @@ MageZero Neural Network architecture for AlphaZero style MCTS:
 
 GLOBAL_MAX = 2**31-1
 
+# CUDA when available; otherwise train/test fall back to CPU (e.g. to smoke-test on a laptop).
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
 PRIORITY_A_MAX = 128
 PRIORITY_B_MAX = 128
 TARGETS_MAX = 128
@@ -146,10 +149,12 @@ class NetTransformer(nn.Module):
 
 
 def load_model(path):
+    # map to CPU so a checkpoint saved on a GPU also loads where there is none;
+    # load_state_dict then copies the weights onto the model's own device
     if path.endswith('.gz'):
         with gzip.open(path, 'rb') as f:
-            return torch.load(f)
-    return torch.load(path)
+            return torch.load(f, map_location="cpu")
+    return torch.load(path, map_location="cpu")
 
 def normalize_policy_labels(raw: torch.Tensor) -> torch.Tensor:
     total = raw.sum(dim=1, keepdim=True).clamp(min=1e-8)

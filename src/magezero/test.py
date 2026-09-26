@@ -6,7 +6,7 @@ from torch.utils.data import DataLoader
 
 from dataset import H5Indexed, collate_batch, filter_opponent_states
 from vocab import FeatureVocab
-from model import NetTransformer, load_model, GLOBAL_MAX, PRIORITY_A_MAX, PRIORITY_B_MAX, TARGETS_MAX, BINARY_MAX, ActionType, lambda_pA, lambda_pB, lambda_t, lambda_b, normalize_policy_labels
+from model import NetTransformer, load_model, DEVICE, GLOBAL_MAX, PRIORITY_A_MAX, PRIORITY_B_MAX, TARGETS_MAX, BINARY_MAX, ActionType, lambda_pA, lambda_pB, lambda_t, lambda_b, normalize_policy_labels
 
 SHOW_CONFUSION_MATRIX = True
 
@@ -61,20 +61,20 @@ def validate(model, dl):
     pB_matrix = torch.zeros(PRIORITY_B_MAX, PRIORITY_B_MAX, dtype=torch.long)
     t_matrix = torch.zeros(TARGETS_MAX, TARGETS_MAX, dtype=torch.long)
     b_matrix = torch.zeros(BINARY_MAX, BINARY_MAX, dtype=torch.long)
-    #model = train.Net(train.GLOBAL_MAX, train.ACTIONS_MAX).cuda()
+    #model = train.Net(train.GLOBAL_MAX, train.ACTIONS_MAX).to(DEVICE)
     model.eval()
     with torch.no_grad():
         for batch_indices, batch_offsets, batch_policy_labels, batch_value_labels, is_players, action_types in dl:
             # Move new input tensors to CUDA
-            batch_indices = batch_indices.cuda()
-            batch_offsets = batch_offsets.cuda()
-            batch_policy_labels = batch_policy_labels.cuda()
-            batch_value_labels = batch_value_labels.cuda()
-            is_players = is_players.cuda().squeeze(-1).to(torch.bool)
-            action_types = action_types.cuda().squeeze(-1).to(torch.long)
+            batch_indices = batch_indices.to(DEVICE)
+            batch_offsets = batch_offsets.to(DEVICE)
+            batch_policy_labels = batch_policy_labels.to(DEVICE)
+            batch_value_labels = batch_value_labels.to(DEVICE)
+            is_players = is_players.to(DEVICE).squeeze(-1).to(torch.bool)
+            action_types = action_types.to(DEVICE).squeeze(-1).to(torch.long)
 
             # Model call uses indices and offsets
-            with torch.amp.autocast('cuda'):
+            with torch.amp.autocast(DEVICE.type, enabled=DEVICE.type == 'cuda'):
                 priority_logits, opponent_priority_logits, target_logits, binary_logits, value_pred = model(batch_indices,
                                                                                                             batch_offsets)
 
@@ -206,7 +206,7 @@ if __name__ == "__main__":
     dl = DataLoader(ds, batch_size=512, shuffle=False, num_workers=0,
                     collate_fn=collate_batch, pin_memory=True, persistent_workers=False)
 
-    model = NetTransformer(len(vocab) if vocab is not None else GLOBAL_MAX).cuda()
+    model = NetTransformer(len(vocab) if vocab is not None else GLOBAL_MAX).to(DEVICE)
     model.eval()
 
     try:

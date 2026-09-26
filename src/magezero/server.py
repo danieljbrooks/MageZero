@@ -48,8 +48,13 @@ def init(deck: str, version: int, port: int):
 
     threading.Thread(target=worker_loop, daemon=True).start()
 
-    print(f"[INIT] deck={deck} ver={version} port={port} device={DEVICE} action_dim={ACTION_DIM}")
-    waitress.serve(app, host="127.0.0.1", port=port, threads=6)
+    print(f"[INIT] deck={deck} ver={version} port={port} device={DEVICE} action_dim={ACTION_DIM} "
+          f"http_threads={os.environ.get('MZ_SERVER_THREADS', 6)}")
+    # One HTTP thread per request in flight. Every request blocks its thread until its batch is
+    # evaluated, so this also caps the batch size. 6 by default; a server shared by several
+    # JVMs needs one thread per game thread querying it (MZ_SERVER_THREADS).
+    threads = int(os.environ.get("MZ_SERVER_THREADS", 6))
+    waitress.serve(app, host="127.0.0.1", port=port, threads=threads)
 
 class Pending:
     __slots__ = ("idx", "off", "evt", "out", "req_id", "pre_count", "post_count", "t_recv", "t_done", "num_bags")
